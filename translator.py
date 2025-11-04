@@ -12,6 +12,10 @@ class CLexer(Lexer):
     literals = {'+', '-', '*', '/', '(', ')', ';', '{', '}', ',', '[', ']'}
     ignore = ' \t'
 
+    @_(r'//[^\n]*')
+    def comment(self, t):
+        pass
+
     @_(r'[a-zA-Z_][a-zA-Z0-9_]*(?=\s*\()')
     def FID(self, t):
         if t.value == 'int':
