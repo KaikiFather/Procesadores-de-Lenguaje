@@ -12,6 +12,10 @@ class CLexer(Lexer):
     literals = {'+', '-', '*', '/', '(', ')', ';', '{', '}', ',', '[', ']'}
     ignore = ' \t'
 
+    @_(r'//[^\n]*')
+    def comment(self, t):
+        pass
+
     @_(r'[a-zA-Z_][a-zA-Z0-9_]*(?=\s*\()')
     def FID(self, t):
         if t.value == 'int':
@@ -361,13 +365,13 @@ class AsmEmitter:
             out.append('')
         out.append('.text')
         out.extend(self.text)
-        return '\\n'.join(out) + '\\n'
+        return '\n'.join(out) + '\n'
     def add_string(self, value):
-        key = f'str_{len(self.strings)}'
-        # naive escape handling
-        esc = value.replace('\\\\', '\\\\\\\\').replace('"', '\\"')
+        key = f's{len(self.strings)}'
+        # Preserve existing escape sequences like \n while only protecting quotes
+        esc = value.replace('"', '\\"')
         self.strings[key] = esc
-        return f'${key}'
+        return key
 
 class CodeGen:
     def __init__(self, module_items):
@@ -378,9 +382,13 @@ class CodeGen:
     def is_const_expr(self, node):
         if isinstance(node, tuple):
             op = node[0]
-            if op == 'const': return True
+            if op == 'const':
+                return True
             if op in ('+', '-', '*', '/', 'neg'):
                 return all(self.is_const_expr(x) for x in node[1:])
+            if op == 'assign_l':
+                # Assignment expressions can be constant if the RHS is constant.
+                return self.is_const_expr(node[2])
             return False
         return False
 
@@ -389,6 +397,9 @@ class CodeGen:
         tag = node[0]
         if tag == 'const': return node[1]
         if tag == 'neg': return - self.eval_const(node[1])
+        if tag == 'assign_l':
+            # For constant contexts, propagate the value of the RHS.
+            return self.eval_const(node[2])
         a = self.eval_const(node[1]); b = self.eval_const(node[2])
         if tag == '+': return a + b
         if tag == '-': return a - b
@@ -413,6 +424,16 @@ class CodeGen:
             else:
                 self.em.emit(f'    movl {node[1]}, %eax')
             return
+        if tag == 'assign_l':
+            lv, rv = node[1], node[2]
+            if isinstance(lv, tuple) and lv[0] == 'id':
+                self.gen_expr(rv, fn)
+                info = self.lookup(fn, lv[1])
+                if info['kind'] in ('local', 'param'):
+                    self.em.emit(f'    movl %eax, {info["offset"]}(%ebp)')
+                else:
+                    self.em.emit(f'    movl %eax, {lv[1]}')
+            return
         if tag == 'neg':
             self.gen_expr(node[1], fn)
             self.em.emit('    negl %eax')
@@ -433,7 +454,15 @@ class CodeGen:
             self.em.emit(f'    movl ${lbl}, %eax')
             return
         if tag == 'call':
-            # no-op for now: ignore calls like scanf/printf
+            callee = node[1]
+            args = node[2]
+            bytes_pushed = 0
+            for arg in reversed(args):
+                self.push_arg(arg, fn)
+                bytes_pushed += 4
+            self.em.emit(f'    call {callee}')
+            if bytes_pushed:
+                self.em.emit(f'    addl ${bytes_pushed}, %esp')
             return
         if tag in ('+', '-', '*', '/'):
             # left -> push, right -> eax, merge
@@ -454,6 +483,40 @@ class CodeGen:
                 self.em.emit('    idivl %ebx')
             return
         # basic fallback: do nothing
+
+    def push_arg(self, node, fn):
+        """Push the value of an expression node onto the stack."""
+        if isinstance(node, tuple):
+            tag = node[0]
+            if tag == 'const':
+                self.em.emit(f'    pushl ${node[1]}')
+                return
+            if tag == 'id':
+                info = self.lookup(fn, node[1])
+                if info['kind'] in ('local', 'param'):
+                    self.em.emit(f'    pushl {info["offset"]}(%ebp)')
+                else:
+                    self.em.emit(f'    pushl {node[1]}')
+                return
+            if tag == 'addr' and isinstance(node[1], tuple) and node[1][0] == 'id':
+                target = node[1][1]
+                info = self.lookup(fn, target)
+                if info['kind'] in ('local', 'param'):
+                    self.em.emit(f'    leal {info["offset"]}(%ebp), %eax')
+                    self.em.emit('    pushl %eax')
+                else:
+                    self.em.emit(f'    pushl ${target}')
+                return
+            if tag == 'string':
+                lbl = self.em.add_string(node[1])
+                self.em.emit(f'    pushl ${lbl}')
+                return
+            if tag == 'call':
+                self.gen_expr(node, fn)
+                self.em.emit('    pushl %eax')
+                return
+        self.gen_expr(node, fn)
+        self.em.emit('    pushl %eax')
 
     def lookup(self, fn, name):
         if fn is None:
@@ -580,10 +643,23 @@ class CodeGen:
         for item in body:
             self.gen_stmt(item, fn)
 
-        # ensure function returns even if no explicit return
-        self.em.emit('    movl %ebp, %esp')
-        self.em.emit('    popl %ebp')
-        self.em.emit('    ret')
+        # ensure function returns even if no explicit return by checking the
+        # last real instruction that was emitted. If control flow already ends
+        # in a `ret`, avoid emitting a duplicate epilogue.
+        needs_epilogue = True
+        for line in reversed(self.em.text):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(':'):
+                # Labels do not affect whether we need the epilogue.
+                continue
+            needs_epilogue = stripped != 'ret'
+            break
+        if needs_epilogue:
+            self.em.emit('    movl %ebp, %esp')
+            self.em.emit('    popl %ebp')
+            self.em.emit('    ret')
 
     def gen_globals(self, decls):
         for decl in decls:
