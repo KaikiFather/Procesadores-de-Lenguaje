@@ -429,6 +429,12 @@ class CodeGen:
                 self.gen_address(base, fn)
             else:
                 self.gen_expr(base, fn)
+            if self.is_const_expr(idx):
+                stride = self.index_stride(base, fn)
+                offset = self.eval_const(idx) * stride
+                if offset:
+                    self.em.emit(f'    addl ${offset}, %eax')
+                return
             self.em.emit('    movl %eax, %ebx')
             self.gen_expr(idx, fn)
             stride = self.index_stride(base, fn)
@@ -477,12 +483,20 @@ class CodeGen:
             return
         if tag == 'id':
             info = self.lookup(fn, node[1])
-            if info['kind'] == 'local':
-                self.em.emit(f'    movl {info["offset"]}(%ebp), %eax')
-            elif info['kind'] == 'param':
+            kind = info.get('kind')
+            typ = info.get('type')
+            if kind == 'local':
+                if typ == 'array':
+                    self.em.emit(f'    leal {info["offset"]}(%ebp), %eax')
+                else:
+                    self.em.emit(f'    movl {info["offset"]}(%ebp), %eax')
+            elif kind == 'param':
                 self.em.emit(f'    movl {info["offset"]}(%ebp), %eax')
             else:
-                self.em.emit(f'    movl {node[1]}, %eax')
+                if typ == 'array':
+                    self.em.emit(f'    movl ${node[1]}, %eax')
+                else:
+                    self.em.emit(f'    movl {node[1]}, %eax')
             return
         if tag == 'assign_l':
             lv, rv = node[1], node[2]
@@ -592,6 +606,43 @@ class CodeGen:
             return
         if tag in ('+', '-', '*', '/'):
             left, right = node[1], node[2]
+            if tag in ('+', '-'):
+                stride, pointer_side = self.pointer_arith_info(tag, left, right, fn)
+                if stride is not None:
+                    if pointer_side == 'left':
+                        pointer_expr, other = left, right
+                    else:
+                        pointer_expr, other = right, left
+                    if self.is_const_expr(other):
+                        offset = self.eval_const(other) * stride
+                        self.gen_expr(pointer_expr, fn)
+                        if offset:
+                            if tag == '+':
+                                self.em.emit(f'    addl ${offset}, %eax')
+                            else:
+                                self.em.emit(f'    subl ${offset}, %eax')
+                        return
+                    if pointer_side == 'left':
+                        self.gen_expr(left, fn)
+                        self.em.emit('    pushl %eax')
+                        self.gen_expr(right, fn)
+                    else:
+                        self.gen_expr(right, fn)
+                        self.em.emit('    pushl %eax')
+                        self.gen_expr(left, fn)
+                    if stride != 1:
+                        self.em.emit(f'    imull ${stride}, %eax')
+                    self.em.emit('    movl %eax, %ebx')
+                    self.em.emit('    popl %eax')
+                    if tag == '+':
+                        self.em.emit('    addl %ebx, %eax')
+                    else:
+                        if pointer_side == 'left':
+                            self.em.emit('    subl %ebx, %eax')
+                        else:
+                            self.em.emit('    subl %eax, %ebx')
+                            self.em.emit('    movl %ebx, %eax')
+                    return
             self.gen_expr(left, fn)
             self.em.emit('    pushl %eax')
             self.gen_expr(right, fn)
@@ -618,10 +669,21 @@ class CodeGen:
                 return
             if tag == 'id':
                 info = self.lookup(fn, node[1])
-                if info['kind'] in ('local', 'param'):
+                kind = info.get('kind')
+                typ = info.get('type')
+                if kind == 'local':
+                    if typ == 'array':
+                        self.em.emit(f'    leal {info["offset"]}(%ebp), %eax')
+                        self.em.emit('    pushl %eax')
+                    else:
+                        self.em.emit(f'    pushl {info["offset"]}(%ebp)')
+                elif kind == 'param':
                     self.em.emit(f'    pushl {info["offset"]}(%ebp)')
                 else:
-                    self.em.emit(f'    pushl {node[1]}')
+                    if typ == 'array':
+                        self.em.emit(f'    pushl ${node[1]}')
+                    else:
+                        self.em.emit(f'    pushl {node[1]}')
                 return
             if tag == 'addr':
                 self.gen_address(node[1], fn)
@@ -651,6 +713,45 @@ class CodeGen:
         info = self.globals.get(name, {}).copy()
         info.setdefault('kind', 'global')
         return info
+
+    def pointer_arith_info(self, op, left, right, fn):
+        """Return (stride, side) if pointer arithmetic is needed."""
+        if op not in ('+', '-'):
+            return (None, None)
+        left_ptr = self.is_pointer_value(left, fn)
+        right_ptr = self.is_pointer_value(right, fn)
+        if left_ptr and not right_ptr:
+            return (self.pointer_stride(left, fn), 'left')
+        if right_ptr and not left_ptr and op == '+':
+            return (self.pointer_stride(right, fn), 'right')
+        return (None, None)
+
+    def is_pointer_value(self, node, fn):
+        if not isinstance(node, tuple):
+            return False
+        tag = node[0]
+        if tag == 'id':
+            info = self.lookup(fn, node[1])
+            return info.get('type') in ('ptr', 'array')
+        if tag == 'addr':
+            return True
+        if tag == 'assign_l':
+            return self.is_pointer_value(node[2], fn)
+        return False
+
+    def pointer_stride(self, node, fn):
+        info = self.resolve_array_info(node, fn)
+        if info is None:
+            return 4
+        _, dims, level = info
+        if not dims:
+            return 4
+        start = level + 1 if level + 1 <= len(dims) else len(dims)
+        remaining = dims[start:]
+        stride = 4
+        for d in remaining:
+            stride *= d if d else 1
+        return stride
 
     # ---- codegen for statements ----
     def gen_stmt(self, node, fn):
