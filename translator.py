@@ -425,6 +425,22 @@ class CodeGen:
             return
         if tag == 'index':
             base, idx = node[1], node[2]
+            if isinstance(base, tuple) and base[0] == 'id' and self.is_const_expr(idx):
+                stride = self.index_stride(base, fn)
+                offset = self.eval_const(idx) * stride
+                info = self.lookup(fn, base[1])
+                kind = info.get('kind')
+                if info.get('type') == 'array':
+                    if kind == 'local':
+                        adj = info['offset'] - offset
+                        self.em.emit(f'    leal {adj}(%ebp), %eax')
+                        return
+                    if kind == 'global':
+                        if offset:
+                            self.em.emit(f'    movl ${base[1]}+{offset}, %eax')
+                        else:
+                            self.em.emit(f'    movl ${base[1]}, %eax')
+                        return
             if isinstance(base, tuple) and base[0] in ('id', 'index'):
                 self.gen_address(base, fn)
             else:
@@ -432,6 +448,16 @@ class CodeGen:
             if self.is_const_expr(idx):
                 stride = self.index_stride(base, fn)
                 offset = self.eval_const(idx) * stride
+                if isinstance(base, tuple) and base[0] == 'id':
+                    info = self.lookup(fn, base[1])
+                    if info.get('kind') == 'local' and info.get('type') == 'array':
+                        if offset:
+                            self.em.emit(f'    subl ${offset}, %eax')
+                        return
+                    if info.get('kind') == 'global' and info.get('type') == 'array':
+                        if offset:
+                            self.em.emit(f'    addl ${offset}, %eax')
+                        return
                 if offset:
                     self.em.emit(f'    addl ${offset}, %eax')
                 return
@@ -439,6 +465,12 @@ class CodeGen:
             self.gen_expr(idx, fn)
             stride = self.index_stride(base, fn)
             self.em.emit(f'    imull ${stride}, %eax')
+            if isinstance(base, tuple) and base[0] == 'id':
+                info = self.lookup(fn, base[1])
+                if info.get('kind') == 'local' and info.get('type') == 'array':
+                    self.em.emit('    subl %eax, %ebx')
+                    self.em.emit('    movl %ebx, %eax')
+                    return
             self.em.emit('    addl %eax, %ebx')
             self.em.emit('    movl %ebx, %eax')
             return
@@ -473,7 +505,30 @@ class CodeGen:
             stride *= d if d else 1
         return stride
 
-    def gen_expr(self, node, fn):
+    def index_direct_operand(self, node, fn):
+        if not isinstance(node, tuple) or node[0] != 'index':
+            return None
+        base, idx = node[1], node[2]
+        if not self.is_const_expr(idx):
+            return None
+        stride = self.index_stride(base, fn)
+        offset = self.eval_const(idx) * stride
+        if isinstance(base, tuple) and base[0] == 'id':
+            info = self.lookup(fn, base[1])
+            kind = info.get('kind')
+            if info.get('type') == 'array':
+                if kind == 'local':
+                    adj = info['offset'] - offset
+                    return f'{adj}(%ebp)'
+                if kind == 'param':
+                    return None
+                # global
+                if offset:
+                    return f'{base[1]}+{offset}'
+                return base[1]
+        return None
+
+    def gen_expr(self, node, fn, want_result=True):
         """Generate code that leaves result in %eax."""
         if node is None:
             return
@@ -507,11 +562,20 @@ class CodeGen:
                 if info['kind'] in ('local', 'param'):
                     self.em.emit(f'    movl %edx, {info["offset"]}(%ebp)')
                 else:
-                    self.em.emit(f'    movl %edx, {lv[1]}')
-            else:
-                self.gen_address(lv, fn)
-                self.em.emit('    movl %edx, (%eax)')
-            self.em.emit('    movl %edx, %eax')
+                    self.em.emit(f'    movl %eax, {lv[1]}')
+                return
+            if isinstance(lv, tuple) and lv[0] == 'deref':
+                ptr_operand = self.simple_operand(lv[1], fn)
+                if ptr_operand is not None:
+                    self.gen_expr(rv, fn)
+                    self.em.emit(f'    movl {ptr_operand}, %edx')
+                    self.em.emit('    movl %eax, (%edx)')
+                    return
+            # general lvalue: compute address first, then value
+            self.gen_address(lv, fn)
+            self.em.emit('    movl %eax, %edx')
+            self.gen_expr(rv, fn)
+            self.em.emit('    movl %eax, (%edx)')
             return
         if tag == 'neg':
             self.gen_expr(node[1], fn)
@@ -525,8 +589,12 @@ class CodeGen:
             self.em.emit('    movl (%eax), %eax')
             return
         if tag == 'index':
-            self.gen_address(node, fn)
-            self.em.emit('    movl (%eax), %eax')
+            direct = self.index_direct_operand(node, fn)
+            if direct is not None:
+                self.em.emit(f'    movl {direct}, %eax')
+            else:
+                self.gen_address(node, fn)
+                self.em.emit('    movl (%eax), %eax')
             return
         if tag == 'string':
             lbl = self.em.add_string(node[1])
@@ -613,14 +681,37 @@ class CodeGen:
                         pointer_expr, other = left, right
                     else:
                         pointer_expr, other = right, left
+                    sign = self.pointer_offset_sign(pointer_expr, fn)
                     if self.is_const_expr(other):
-                        offset = self.eval_const(other) * stride
+                        raw_offset = self.eval_const(other) * stride
+                        if isinstance(pointer_expr, tuple) and pointer_expr[0] == 'id':
+                            info = self.lookup(fn, pointer_expr[1])
+                            kind = info.get('kind')
+                            if info.get('type') == 'array':
+                                if kind == 'local':
+                                    adj = info['offset'] - raw_offset
+                                    self.em.emit(f'    leal {adj}(%ebp), %eax')
+                                    return
+                                if kind == 'global':
+                                    if raw_offset:
+                                        self.em.emit(f'    movl ${pointer_expr[1]}+{raw_offset}, %eax')
+                                    else:
+                                        self.em.emit(f'    movl ${pointer_expr[1]}, %eax')
+                                    return
+                        offset = raw_offset * sign
                         self.gen_expr(pointer_expr, fn)
                         if offset:
-                            if tag == '+':
-                                self.em.emit(f'    addl ${offset}, %eax')
+                            if offset > 0:
+                                op = 'addl'
+                                val = offset
                             else:
-                                self.em.emit(f'    subl ${offset}, %eax')
+                                op = 'subl'
+                                val = -offset
+                            if tag == '+' or pointer_side == 'right':
+                                self.em.emit(f'    {op} ${val}, %eax')
+                            else:
+                                rev = 'subl' if op == 'addl' else 'addl'
+                                self.em.emit(f'    {rev} ${val}, %eax')
                         return
                     if pointer_side == 'left':
                         self.gen_expr(left, fn)
@@ -634,15 +725,37 @@ class CodeGen:
                         self.em.emit(f'    imull ${stride}, %eax')
                     self.em.emit('    movl %eax, %ebx')
                     self.em.emit('    popl %eax')
-                    if tag == '+':
-                        self.em.emit('    addl %ebx, %eax')
-                    else:
-                        if pointer_side == 'left':
-                            self.em.emit('    subl %ebx, %eax')
+                    if pointer_side == 'left':
+                        if tag == '+':
+                            if sign > 0:
+                                self.em.emit('    addl %ebx, %eax')
+                            else:
+                                self.em.emit('    subl %ebx, %eax')
                         else:
-                            self.em.emit('    subl %eax, %ebx')
-                            self.em.emit('    movl %ebx, %eax')
+                            if sign > 0:
+                                self.em.emit('    subl %ebx, %eax')
+                            else:
+                                self.em.emit('    addl %ebx, %eax')
+                    else:
+                        if sign > 0:
+                            self.em.emit('    addl %ebx, %eax')
+                        else:
+                            self.em.emit('    subl %ebx, %eax')
                     return
+            rhs_operand = self.simple_operand(right, fn)
+            if rhs_operand is not None:
+                self.gen_expr(left, fn)
+                if tag == '+':
+                    self.em.emit(f'    addl {rhs_operand}, %eax')
+                elif tag == '-':
+                    self.em.emit(f'    subl {rhs_operand}, %eax')
+                elif tag == '*':
+                    self.em.emit(f'    imull {rhs_operand}, %eax')
+                else:
+                    self.em.emit(f'    movl {rhs_operand}, %ebx')
+                    self.em.emit('    cdq')
+                    self.em.emit('    idivl %ebx')
+                return
             self.gen_expr(left, fn)
             self.em.emit('    pushl %eax')
             self.gen_expr(right, fn)
@@ -689,6 +802,11 @@ class CodeGen:
                 self.gen_address(node[1], fn)
                 self.em.emit('    pushl %eax')
                 return
+            if tag == 'index':
+                direct = self.index_direct_operand(node, fn)
+                if direct is not None:
+                    self.em.emit(f'    pushl {direct}')
+                    return
             if tag == 'string':
                 lbl = self.em.add_string(node[1])
                 self.em.emit(f'    pushl ${lbl}')
@@ -726,6 +844,13 @@ class CodeGen:
             return (self.pointer_stride(right, fn), 'right')
         return (None, None)
 
+    def pointer_offset_sign(self, pointer_expr, fn):
+        if isinstance(pointer_expr, tuple) and pointer_expr[0] == 'id':
+            info = self.lookup(fn, pointer_expr[1])
+            if info.get('kind') == 'local' and info.get('type') == 'array':
+                return -1
+        return 1
+
     def is_pointer_value(self, node, fn):
         if not isinstance(node, tuple):
             return False
@@ -753,16 +878,38 @@ class CodeGen:
             stride *= d if d else 1
         return stride
 
+    def simple_operand(self, node, fn):
+        """Return an AT&T operand string for simple expressions."""
+        if not isinstance(node, tuple):
+            return None
+        tag = node[0]
+        if tag == 'const':
+            return f'${node[1]}'
+        if tag == 'id':
+            info = self.lookup(fn, node[1])
+            kind = info.get('kind')
+            typ = info.get('type')
+            if typ == 'array':
+                return None
+            if kind == 'local':
+                return f'{info["offset"]}(%ebp)'
+            if kind == 'param':
+                return f'{info["offset"]}(%ebp)'
+            return node[1]
+        if tag == 'index':
+            return self.index_direct_operand(node, fn)
+        return None
+
     # ---- codegen for statements ----
     def gen_stmt(self, node, fn):
         if node is None:
             return
         tag = node[0]
         if tag == 'exprstmt':
-            self.gen_expr(node[1], fn)
+            self.gen_expr(node[1], fn, want_result=False)
             return
         if tag == 'assign_l':
-            self.gen_expr(node, fn)
+            self.gen_expr(node, fn, want_result=False)
             return
         if tag == 'if':
             cond, then_s, else_s = node[1], node[2], node[3]
