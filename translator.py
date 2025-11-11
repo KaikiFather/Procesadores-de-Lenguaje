@@ -555,11 +555,12 @@ class CodeGen:
             return
         if tag == 'assign_l':
             lv, rv = node[1], node[2]
+            self.gen_expr(rv, fn)
+            self.em.emit('    movl %eax, %edx')
             if isinstance(lv, tuple) and lv[0] == 'id':
-                self.gen_expr(rv, fn)
                 info = self.lookup(fn, lv[1])
                 if info['kind'] in ('local', 'param'):
-                    self.em.emit(f'    movl %eax, {info["offset"]}(%ebp)')
+                    self.em.emit(f'    movl %edx, {info["offset"]}(%ebp)')
                 else:
                     self.em.emit(f'    movl %eax, {lv[1]}')
                 return
