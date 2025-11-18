@@ -425,6 +425,20 @@ class CodeGen:
             return
         if tag == 'index':
             base, idx = node[1], node[2]
+            const_info = self.const_index_offset(node, fn)
+            if const_info is not None:
+                name, info, offset = const_info
+                kind = info.get('kind')
+                if kind == 'local':
+                    adj = info['offset'] - offset
+                    self.em.emit(f'    leal {adj}(%ebp), %eax')
+                    return
+                if kind == 'global':
+                    if offset:
+                        self.em.emit(f'    movl ${name}+{offset}, %eax')
+                    else:
+                        self.em.emit(f'    movl ${name}, %eax')
+                    return
             if isinstance(base, tuple) and base[0] == 'id' and self.is_const_expr(idx):
                 stride = self.index_stride(base, fn)
                 offset = self.eval_const(idx) * stride
@@ -506,26 +520,34 @@ class CodeGen:
         return stride
 
     def index_direct_operand(self, node, fn):
-        if not isinstance(node, tuple) or node[0] != 'index':
+        res = self.const_index_offset(node, fn)
+        if res is None:
             return None
-        base, idx = node[1], node[2]
-        if not self.is_const_expr(idx):
-            return None
-        stride = self.index_stride(base, fn)
-        offset = self.eval_const(idx) * stride
-        if isinstance(base, tuple) and base[0] == 'id':
-            info = self.lookup(fn, base[1])
-            kind = info.get('kind')
+        name, info, offset = res
+        kind = info.get('kind')
+        if kind == 'local':
+            adj = info['offset'] - offset
+            return f'{adj}(%ebp)'
+        if kind == 'global':
+            if offset:
+                return f'{name}+{offset}'
+            return name
+        return None
+
+    def const_index_offset(self, node, fn):
+        total = 0
+        cur = node
+        while isinstance(cur, tuple) and cur and cur[0] == 'index':
+            base, idx = cur[1], cur[2]
+            if not self.is_const_expr(idx):
+                return None
+            stride = self.index_stride(base, fn)
+            total += self.eval_const(idx) * stride
+            cur = base
+        if isinstance(cur, tuple) and cur and cur[0] == 'id':
+            info = self.lookup(fn, cur[1])
             if info.get('type') == 'array':
-                if kind == 'local':
-                    adj = info['offset'] - offset
-                    return f'{adj}(%ebp)'
-                if kind == 'param':
-                    return None
-                # global
-                if offset:
-                    return f'{base[1]}+{offset}'
-                return base[1]
+                return cur[1], info, total
         return None
 
     def gen_expr(self, node, fn, want_result=True):
@@ -900,6 +922,85 @@ class CodeGen:
             return self.index_direct_operand(node, fn)
         return None
 
+    def address_literal(self, node, fn=None):
+        if not isinstance(node, tuple):
+            return None
+        tag = node[0]
+        if tag == 'string':
+            lbl = self.em.add_string(node[1])
+            return lbl
+        if tag == 'id':
+            info = self.lookup(fn, node[1])
+            if info.get('type') == 'array':
+                return node[1]
+            return None
+        if tag == 'addr':
+            target = node[1]
+            if isinstance(target, tuple) and target[0] == 'id':
+                return target[1]
+            res = self.const_index_offset(target, fn)
+            if res is not None:
+                name, info, offset = res
+                if info.get('kind') == 'global':
+                    if offset:
+                        return f'{name}+{offset}'
+                    return name
+        if tag == 'index':
+            res = self.const_index_offset(node, fn)
+            if res is not None:
+                name, info, offset = res
+                if info.get('kind') == 'global':
+                    if offset:
+                        return f'{name}+{offset}'
+                    return name
+        return None
+
+    def emit_conditional_branch(self, jump_instr, true_lbl, false_lbl):
+        self.em.emit(f'    {jump_instr} {true_lbl}')
+        self.em.emit(f'    jmp {false_lbl}')
+
+    def gen_condition(self, node, fn, true_lbl, false_lbl):
+        if node is None:
+            self.em.emit(f'    jmp {false_lbl}')
+            return
+        tag = node[0] if isinstance(node, tuple) else None
+        if tag == 'or':
+            rhs_lbl = self.fresh_label('or_rhs')
+            self.gen_condition(node[1], fn, true_lbl, rhs_lbl)
+            self.em.label(rhs_lbl)
+            self.gen_condition(node[2], fn, true_lbl, false_lbl)
+            return
+        if tag == 'and':
+            rhs_lbl = self.fresh_label('and_rhs')
+            self.gen_condition(node[1], fn, rhs_lbl, false_lbl)
+            self.em.label(rhs_lbl)
+            self.gen_condition(node[2], fn, true_lbl, false_lbl)
+            return
+        if tag == 'not':
+            self.gen_condition(node[1], fn, false_lbl, true_lbl)
+            return
+        if tag in ('==', '!=', '<', '>', '<=', '>='):
+            left, right = node[1], node[2]
+            self.gen_expr(left, fn)
+            self.em.emit('    pushl %eax')
+            self.gen_expr(right, fn)
+            self.em.emit('    movl %eax, %ebx')
+            self.em.emit('    popl %eax')
+            self.em.emit('    cmpl %ebx, %eax')
+            jump_map = {
+                '==': 'je',
+                '!=': 'jne',
+                '<': 'jl',
+                '<=': 'jle',
+                '>': 'jg',
+                '>=': 'jge',
+            }
+            self.emit_conditional_branch(jump_map[tag], true_lbl, false_lbl)
+            return
+        self.gen_expr(node, fn)
+        self.em.emit('    cmpl $0, %eax')
+        self.emit_conditional_branch('jne', true_lbl, false_lbl)
+
     # ---- codegen for statements ----
     def gen_stmt(self, node, fn):
         if node is None:
@@ -913,17 +1014,24 @@ class CodeGen:
             return
         if tag == 'if':
             cond, then_s, else_s = node[1], node[2], node[3]
-            self.gen_expr(cond, fn)
-            lbl_else = f'.Lelse_{id(node)}'
-            lbl_end  = f'.Lend_{id(node)}'
-            self.em.emit('    cmpl $0, %eax')
-            self.em.emit(f'    je {lbl_else}')
-            self.gen_stmt(then_s, fn)
-            self.em.emit(f'    jmp {lbl_end}')
-            self.em.emit(f'{lbl_else}:')
             if else_s is not None:
+                lbl_then = self.fresh_label('if_then')
+                lbl_else = self.fresh_label('if_else')
+                lbl_end = self.fresh_label('if_end')
+                self.gen_condition(cond, fn, lbl_then, lbl_else)
+                self.em.label(lbl_then)
+                self.gen_stmt(then_s, fn)
+                self.em.emit(f'    jmp {lbl_end}')
+                self.em.label(lbl_else)
                 self.gen_stmt(else_s, fn)
-            self.em.emit(f'{lbl_end}:')
+                self.em.label(lbl_end)
+            else:
+                lbl_then = self.fresh_label('if_then')
+                lbl_end = self.fresh_label('if_end')
+                self.gen_condition(cond, fn, lbl_then, lbl_end)
+                self.em.label(lbl_then)
+                self.gen_stmt(then_s, fn)
+                self.em.label(lbl_end)
             return
         if tag == 'block':
             for item in node[1]:
@@ -1063,7 +1171,10 @@ class CodeGen:
             name = decl[1]
             if kind in ('var', 'ptr'):
                 init = decl[2]
-                if init is None:
+                literal = self.address_literal(init) if init is not None else None
+                if literal is not None:
+                    self.em.emit_data(f'{name}: .long {literal}')
+                elif init is None:
                     self.em.emit_data(f'{name}: .long 0')
                 elif isinstance(init, tuple) and self.is_const_expr(init):
                     val = self.eval_const(init)
