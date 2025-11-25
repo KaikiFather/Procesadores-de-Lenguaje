@@ -7,7 +7,7 @@ class CLexer(Lexer):
     tokens = {
         'FID', 'ID', 'CTEENT', 'ASSIGN', 'OR', 'AND', 'NOT',
         'EQ', 'NE', 'LE', 'GE', 'LT', 'GT', 'INT', 'RETURN',
-        'VOID', 'STRING', 'AMP', 'IF', 'ELSE'
+        'VOID', 'STRING', 'AMP', 'IF', 'ELSE', 'WHILE'
     }
     literals = {'+', '-', '*', '/', '(', ')', ';', '{', '}', ',', '[', ']'}
     ignore = ' \t'
@@ -26,6 +26,8 @@ class CLexer(Lexer):
             t.type = 'RETURN'
         elif t.value == 'if':
             t.type = 'IF'
+        elif t.value == 'while':
+            t.type = 'WHILE'
         return t
 
     INT     = r'int'
@@ -33,6 +35,7 @@ class CLexer(Lexer):
     RETURN  = r'return'
     IF      = r'if'
     ELSE    = r'else'
+    WHILE   = r'while'
 
     ID      = r'[a-zA-Z_][a-zA-Z0-9_]*'
     CTEENT  = r'\d+'
@@ -194,6 +197,9 @@ class CParser(Parser):
 
     @_( 'RETURN ";"' )
     def stmt(self, p): return ('return', None)
+
+    @_( 'WHILE "(" t_expr ")" stmt' )
+    def stmt(self, p): return ('while', p.t_expr, p.stmt)
 
     @_( '";"' )
     def stmt(self, p): return None
@@ -1033,6 +1039,18 @@ class CodeGen:
                 self.gen_stmt(then_s, fn)
                 self.em.label(lbl_end)
             return
+        if tag == 'while':
+            cond, body = node[1], node[2]
+            lbl_cond = self.fresh_label('while_cond')
+            lbl_body = self.fresh_label('while_body')
+            lbl_end = self.fresh_label('while_end')
+            self.em.label(lbl_cond)
+            self.gen_condition(cond, fn, lbl_body, lbl_end)
+            self.em.label(lbl_body)
+            self.gen_stmt(body, fn)
+            self.em.emit(f'    jmp {lbl_cond}')
+            self.em.label(lbl_end)
+            return
         if tag == 'block':
             for item in node[1]:
                 self.gen_stmt(item, fn)
@@ -1165,6 +1183,8 @@ class CodeGen:
             self.em.emit('    popl %ebp')
             self.em.emit('    ret')
 
+        self.em.emit(f'.size {name}, .-{name}')
+
     def gen_globals(self, decls):
         for decl in decls:
             kind = decl[0]
@@ -1172,6 +1192,8 @@ class CodeGen:
             if kind in ('var', 'ptr'):
                 init = decl[2]
                 literal = self.address_literal(init) if init is not None else None
+                self.em.emit_data(f'.globl {name}')
+                self.em.emit_data(f'.type {name}, @object')
                 if literal is not None:
                     self.em.emit_data(f'{name}: .long {literal}')
                 elif init is None:
@@ -1181,12 +1203,15 @@ class CodeGen:
                     self.em.emit_data(f'{name}: .long {val}')
                 else:
                     self.em.emit_data(f'{name}: .long 0')
+                self.em.emit_data(f'.size {name}, 4')
                 self.globals[name] = {'type': kind, 'size': 4}
             elif kind == 'array':
                 dims = list(decl[2])
                 init = decl[3]
                 elems = self.array_elems(dims, init)
                 self.globals[name] = {'type': 'array', 'dims': dims, 'size': 4 * elems}
+                self.em.emit_data(f'.globl {name}')
+                self.em.emit_data(f'.type {name}, @object')
                 if init is not None and isinstance(init, tuple) and init[0] == 'initlist':
                     self.em.emit_data(f'{name}:')
                     for expr in init[1]:
@@ -1202,6 +1227,7 @@ class CodeGen:
                         self.em.emit_data(f'    .zero {remaining * 4}')
                 else:
                     self.em.emit_data(f'{name}: .zero {elems * 4}')
+                self.em.emit_data(f'.size {name}, {elems * 4}')
 
     def generate(self):
         # walk module items
