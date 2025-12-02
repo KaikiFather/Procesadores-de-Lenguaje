@@ -62,6 +62,8 @@ class CLexer(Lexer):
         self.index += 1
 
 # --------- Parser builds an AST ---------
+
+
 class CParser(Parser):
     tokens = CLexer.tokens
     precedence = (
@@ -77,6 +79,8 @@ class CParser(Parser):
 
     def __init__(self):
         self.module_items = []  # sequence of top-level declarations and function defs
+        # Grammar rules for while loops (the body is any `stmt`, allowing nested blocks).
+        self.while_grammar_rules = ['stmt : WHILE "(" t_expr ")" stmt']
 
     # ---- driver rules ----
     @_( 'lines line' )
@@ -1008,6 +1012,18 @@ class CodeGen:
         self.emit_conditional_branch('jne', true_lbl, false_lbl)
 
     # ---- codegen for statements ----
+    def gen_while(self, cond, body, fn):
+        """Generate assembler for a while loop using the AST nodes."""
+        lbl_cond = self.fresh_label('while_cond')
+        lbl_body = self.fresh_label('while_body')
+        lbl_end = self.fresh_label('while_end')
+        self.em.label(lbl_cond)
+        self.gen_condition(cond, fn, lbl_body, lbl_end)
+        self.em.label(lbl_body)
+        self.gen_stmt(body, fn)
+        self.em.emit(f'    jmp {lbl_cond}')
+        self.em.label(lbl_end)
+
     def gen_stmt(self, node, fn):
         if node is None:
             return
@@ -1041,15 +1057,7 @@ class CodeGen:
             return
         if tag == 'while':
             cond, body = node[1], node[2]
-            lbl_cond = self.fresh_label('while_cond')
-            lbl_body = self.fresh_label('while_body')
-            lbl_end = self.fresh_label('while_end')
-            self.em.label(lbl_cond)
-            self.gen_condition(cond, fn, lbl_body, lbl_end)
-            self.em.label(lbl_body)
-            self.gen_stmt(body, fn)
-            self.em.emit(f'    jmp {lbl_cond}')
-            self.em.label(lbl_end)
+            self.gen_while(cond, body, fn)
             return
         if tag == 'block':
             for item in node[1]:
@@ -1250,11 +1258,19 @@ def parse_source(src):
     asm = gen.generate()
     return asm
 
+
+def get_while_grammar_rules():
+    """Return the grammar productions that recognize while loops."""
+    parser = CParser()
+    return parser.while_grammar_rules
+
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    if not args:
         print("uso: python translator.py fuente.c", file=sys.stderr)
         sys.exit(1)
-    inpath = sys.argv[1]
+
+    inpath = args[0]
     with open(inpath, 'r') as f:
         code = f.read()
     asm = parse_source(code)
