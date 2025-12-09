@@ -1365,6 +1365,10 @@ class TypeChecker:
     def check_stmt(self, node, env, rettype):
         if node is None:
             return
+        if isinstance(node, list):
+            for item in node:
+                self.check_stmt(item, env, rettype)
+            return
         tag = node[0]
         if tag in ('exprstmt', 'assign_l'):
             self.check_expr(node[1] if tag == 'exprstmt' else node, env)
@@ -1452,17 +1456,23 @@ class TypeChecker:
             elif ltype != rtype:
                 self.error('type mismatch in assignment')
             return rtype
-        if tag in ('neg', 'not'):
-            return self.check_expr(node[1], env)
+        if tag == 'neg':
+            self.ensure_int(node[1], env, 'unary negation')
+            return 'int'
+        if tag == 'not':
+            self.ensure_int(node[1], env, 'logical not')
+            return 'int'
         if tag in ('+', '-','*','/'):
             left_t = self.check_expr(node[1], env)
             right_t = self.check_expr(node[2], env)
             left_decay = self.decay_type(left_t)
             right_decay = self.decay_type(right_t)
-            if tag in ('+', '-') and (
+            if tag == '+' and (
                 (self.pointer_like(left_decay) and right_decay == 'int') or
                 (self.pointer_like(right_decay) and left_decay == 'int')
             ):
+                return 'ptr'
+            if tag == '-' and self.pointer_like(left_decay) and right_decay == 'int':
                 return 'ptr'
             if left_decay != 'int' or right_decay != 'int':
                 self.error('arithmetic requires integer operands')
@@ -1489,11 +1499,12 @@ class TypeChecker:
             expected = sig['params']
             if len(args) != len(expected):
                 self.error(f'function {callee} expects {len(expected)} arguments')
-            for idx, arg in enumerate(args[:len(expected)]):
+            for idx, arg in enumerate(args):
                 actual_t = self.check_expr(arg, env)
-                want = expected[idx]
-                if actual_t != want:
-                    self.error(f'argument {idx+1} to {callee} must be {want}')
+                if idx < len(expected):
+                    want = expected[idx]
+                    if actual_t != want:
+                        self.error(f'argument {idx+1} to {callee} must be {want}')
             return 'int' if sig['rettype'] == 'int' else 'void'
         self.error(f"unsupported expression node {tag}")
         return 'int'
@@ -1508,8 +1519,14 @@ class TypeChecker:
                     return 'int'
                 return env[name]
             if tag == 'deref':
+                base_t = self.check_expr(node[1], env)
+                if not self.pointer_like(base_t):
+                    self.error('cannot dereference non-pointer')
                 return 'int'
             if tag == 'index':
+                base_t = self.check_expr(node[1], env)
+                if not self.pointer_like(base_t):
+                    self.error('indexing requires pointer or array')
                 return 'int'
         return 'int'
 
