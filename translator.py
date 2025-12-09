@@ -1472,6 +1472,8 @@ class TypeChecker:
                 (self.pointer_like(right_decay) and left_decay == 'int')
             ):
                 return 'ptr'
+            if tag == '-' and self.pointer_like(left_decay) and self.pointer_like(right_decay):
+                return 'int'
             if tag == '-' and self.pointer_like(left_decay) and right_decay == 'int':
                 return 'ptr'
             if left_decay != 'int' or right_decay != 'int':
