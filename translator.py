@@ -1527,6 +1527,7 @@ class TypeChecker:
                 base_t = self.check_expr(node[1], env)
                 if not self.pointer_like(base_t):
                     self.error('indexing requires pointer or array')
+                self.ensure_int(node[2], env, 'array index')
                 return 'int'
         return 'int'
 
