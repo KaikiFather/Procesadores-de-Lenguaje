@@ -706,6 +706,26 @@ class CodeGen:
             return
         if tag in ('+', '-', '*', '/'):
             left, right = node[1], node[2]
+            if tag == '-' and self.is_pointer_value(left, fn) and self.is_pointer_value(right, fn):
+                stride = self.pointer_stride(left, fn)
+                other_stride = self.pointer_stride(right, fn)
+                if stride != other_stride:
+                    raise TypeError('pointer subtraction requires compatible pointer strides')
+                self.gen_expr(left, fn)
+                self.em.emit('    pushl %eax')
+                rhs_simple = self.simple_operand(right, fn)
+                if rhs_simple is not None:
+                    self.em.emit(f'    movl {rhs_simple}, %eax')
+                else:
+                    self.gen_expr(right, fn)
+                self.em.emit('    movl %eax, %ebx')
+                self.em.emit('    popl %eax')
+                self.em.emit('    subl %ebx, %eax')
+                if stride != 1:
+                    self.em.emit(f'    movl ${stride}, %ebx')
+                    self.em.emit('    cdq')
+                    self.em.emit('    idivl %ebx')
+                return
             if tag in ('+', '-'):
                 stride, pointer_side = self.pointer_arith_info(tag, left, right, fn)
                 if stride is not None:
@@ -1273,6 +1293,7 @@ class TypeChecker:
         self.module_items = module_items
         self.globals = {}
         self.functions = {}
+        self.array_dims = {}
         self.errors = []
 
     def decay_type(self, typ):
@@ -1306,6 +1327,7 @@ class TypeChecker:
                         self.globals[name] = 'ptr'
                     elif kind == 'array':
                         self.globals[name] = 'array'
+                        self.array_dims[name] = list(decl[2])
             elif tag == 'fun':
                 _, rettype, name, params, _ = item
                 param_types = []
@@ -1344,6 +1366,7 @@ class TypeChecker:
                             env[name] = 'ptr'
                         elif kind == 'array':
                             env[name] = 'array'
+                            self.array_dims[name] = list(d[2])
                 elif isinstance(it, list):
                     walk(it)
                 elif isinstance(it, tuple) and it and it[0] == 'block':
@@ -1364,6 +1387,10 @@ class TypeChecker:
 
     def check_stmt(self, node, env, rettype):
         if node is None:
+            return
+        if isinstance(node, list):
+            for item in node:
+                self.check_stmt(item, env, rettype)
             return
         tag = node[0]
         if tag in ('exprstmt', 'assign_l'):
@@ -1414,6 +1441,39 @@ class TypeChecker:
         else:
             self.error(f"unsupported statement node {tag}")
 
+    def resolve_array_env(self, node):
+        if isinstance(node, tuple):
+            tag = node[0]
+            if tag == 'id':
+                dims = self.array_dims.get(node[1])
+                if dims is not None:
+                    return node[1], dims, 0
+            if tag == 'index':
+                res = self.resolve_array_env(node[1])
+                if res is not None:
+                    name, dims, level = res
+                    return name, dims, level + 1
+        return None
+
+    def pointer_stride_env(self, node):
+        info = self.resolve_array_env(node)
+        if info is None:
+            return 4
+        _, dims, level = info
+        if not dims:
+            return 4
+        start = level + 1 if level + 1 <= len(dims) else len(dims)
+        remaining = dims[start:]
+        stride = 4
+        for d in remaining:
+            stride *= d if d else 1
+        return stride
+
+    def pointer_compatible(self, left, right, env):
+        left_stride = self.pointer_stride_env(left)
+        right_stride = self.pointer_stride_env(right)
+        return left_stride == right_stride
+
     def check_expr(self, node, env):
         if node is None:
             return 'void'
@@ -1445,6 +1505,8 @@ class TypeChecker:
             return 'int'
         if tag == 'assign_l':
             lval, rval = node[1], node[2]
+            if isinstance(lval, tuple) and lval[0] in ('deref', 'index'):
+                self.check_expr(lval, env)
             ltype = self.lvalue_type(lval, env)
             rtype = self.check_expr(rval, env)
             if ltype == 'array':
@@ -1452,17 +1514,27 @@ class TypeChecker:
             elif ltype != rtype:
                 self.error('type mismatch in assignment')
             return rtype
-        if tag in ('neg', 'not'):
-            return self.check_expr(node[1], env)
+        if tag == 'neg':
+            self.ensure_int(node[1], env, 'unary negation')
+            return 'int'
+        if tag == 'not':
+            self.ensure_int(node[1], env, 'logical not')
+            return 'int'
         if tag in ('+', '-','*','/'):
             left_t = self.check_expr(node[1], env)
             right_t = self.check_expr(node[2], env)
             left_decay = self.decay_type(left_t)
             right_decay = self.decay_type(right_t)
-            if tag in ('+', '-') and (
+            if tag == '+' and (
                 (self.pointer_like(left_decay) and right_decay == 'int') or
                 (self.pointer_like(right_decay) and left_decay == 'int')
             ):
+                return 'ptr'
+            if tag == '-' and self.pointer_like(left_decay) and self.pointer_like(right_decay):
+                if not self.pointer_compatible(left, right, env):
+                    self.error('cannot subtract pointers to different base types')
+                return 'int'
+            if tag == '-' and self.pointer_like(left_decay) and right_decay == 'int':
                 return 'ptr'
             if left_decay != 'int' or right_decay != 'int':
                 self.error('arithmetic requires integer operands')
@@ -1489,11 +1561,12 @@ class TypeChecker:
             expected = sig['params']
             if len(args) != len(expected):
                 self.error(f'function {callee} expects {len(expected)} arguments')
-            for idx, arg in enumerate(args[:len(expected)]):
+            for idx, arg in enumerate(args):
                 actual_t = self.check_expr(arg, env)
-                want = expected[idx]
-                if actual_t != want:
-                    self.error(f'argument {idx+1} to {callee} must be {want}')
+                if idx < len(expected):
+                    want = expected[idx]
+                    if actual_t != want:
+                        self.error(f'argument {idx+1} to {callee} must be {want}')
             return 'int' if sig['rettype'] == 'int' else 'void'
         self.error(f"unsupported expression node {tag}")
         return 'int'
