@@ -1254,6 +1254,8 @@ def parse_source(src):
     lexer = CLexer()
     parser = CParser()
     parser.parse(lexer.tokenize(src))  # fills parser.module_items
+    checker = TypeChecker(parser.module_items)
+    checker.check()
     gen = CodeGen(parser.module_items)
     asm = gen.generate()
     return asm
@@ -1263,6 +1265,253 @@ def get_while_grammar_rules():
     """Return the grammar productions that recognize while loops."""
     parser = CParser()
     return parser.while_grammar_rules
+
+class TypeChecker:
+    """Perform a lightweight semantic pass over the parsed module items."""
+
+    def __init__(self, module_items):
+        self.module_items = module_items
+        self.globals = {}
+        self.functions = {}
+        self.errors = []
+
+    def decay_type(self, typ):
+        return 'ptr' if typ == 'array' else typ
+
+    def pointer_like(self, typ):
+        return typ in ('ptr', 'array')
+
+    def error(self, msg):
+        self.errors.append(msg)
+
+    def array_size(self, dims):
+        size = 1
+        for d in dims:
+            if d is None:
+                return None
+            size *= d
+        return size
+
+    def collect_symbols(self):
+        for item in self.module_items:
+            if not isinstance(item, tuple) or not item:
+                continue
+            tag = item[0]
+            if tag == 'globals':
+                for decl in item[1]:
+                    kind, name = decl[0], decl[1]
+                    if kind == 'var':
+                        self.globals[name] = 'int'
+                    elif kind == 'ptr':
+                        self.globals[name] = 'ptr'
+                    elif kind == 'array':
+                        self.globals[name] = 'array'
+            elif tag == 'fun':
+                _, rettype, name, params, _ = item
+                param_types = []
+                for p in params:
+                    if p[0] == 'param':
+                        param_types.append('int')
+                    elif p[0] == 'paramptr':
+                        param_types.append('ptr')
+                self.functions[name] = {'rettype': rettype, 'params': param_types}
+
+    def check(self):
+        self.collect_symbols()
+        for item in self.module_items:
+            if isinstance(item, tuple) and item and item[0] == 'fun':
+                _, rettype, name, params, body = item
+                self.check_function(rettype, name, params, body)
+        if self.errors:
+            raise TypeError('\n'.join(self.errors))
+
+    def make_env(self, params, body):
+        env = dict(self.globals)
+        for p in params:
+            if p[0] == 'param':
+                env[p[1]] = 'int'
+            elif p[0] == 'paramptr':
+                env[p[1]] = 'ptr'
+
+        def walk(items):
+            for it in items:
+                if isinstance(it, tuple) and it and it[0] == 'decls':
+                    for d in it[1]:
+                        kind, name = d[0], d[1]
+                        if kind == 'var':
+                            env[name] = 'int'
+                        elif kind == 'ptr':
+                            env[name] = 'ptr'
+                        elif kind == 'array':
+                            env[name] = 'array'
+                elif isinstance(it, list):
+                    walk(it)
+                elif isinstance(it, tuple) and it and it[0] == 'block':
+                    walk(it[1])
+
+        walk(body)
+        return env
+
+    def check_function(self, rettype, name, params, body):
+        env = self.make_env(params, body)
+        for stmt in body:
+            self.check_stmt(stmt, env, rettype)
+
+    def ensure_int(self, node, env, context):
+        typ = self.check_expr(node, env)
+        if typ != 'int':
+            self.error(f"{context} requires integer expression")
+
+    def check_stmt(self, node, env, rettype):
+        if node is None:
+            return
+        tag = node[0]
+        if tag in ('exprstmt', 'assign_l'):
+            self.check_expr(node[1] if tag == 'exprstmt' else node, env)
+        elif tag == 'if':
+            self.ensure_int(node[1], env, 'if condition')
+            self.check_stmt(node[2], env, rettype)
+            if node[3] is not None:
+                self.check_stmt(node[3], env, rettype)
+        elif tag == 'while':
+            self.ensure_int(node[1], env, 'while condition')
+            self.check_stmt(node[2], env, rettype)
+        elif tag == 'block':
+            for item in node[1]:
+                self.check_stmt(item, env, rettype)
+        elif tag == 'decls':
+            for decl in node[1]:
+                kind = decl[0]
+                name = decl[1]
+                init = decl[3] if kind == 'array' else decl[2]
+                if init is None:
+                    continue
+                if kind == 'array':
+                    dims = decl[2]
+                    if init[0] == 'initlist':
+                        total = self.array_size(dims)
+                        if total is not None and len(init[1]) > total:
+                            self.error(f"too many initializers for array {name}")
+                        for expr in init[1]:
+                            if self.check_expr(expr, env) != 'int':
+                                self.error(f"array {name} initializers must be int")
+                    elif self.check_expr(init, env) != 'int':
+                        self.error(f"array {name} initializer must be integer list")
+                    continue
+                init_type = self.check_expr(init, env)
+                expected = 'int' if kind == 'var' else 'ptr'
+                if init_type != expected:
+                    self.error(f"initializer for {name} must be {expected}")
+        elif tag == 'return':
+            value = node[1]
+            if rettype == 'void' and value is not None:
+                self.error('void function cannot return a value')
+            elif rettype == 'int':
+                if value is None:
+                    self.error('non-void function must return a value')
+                elif self.check_expr(value, env) != 'int':
+                    self.error('return value must be integer')
+        else:
+            self.error(f"unsupported statement node {tag}")
+
+    def check_expr(self, node, env):
+        if node is None:
+            return 'void'
+        if not isinstance(node, tuple):
+            return 'int'
+        tag = node[0]
+        if tag == 'const':
+            return 'int'
+        if tag == 'string':
+            return 'ptr'
+        if tag == 'id':
+            name = node[1]
+            if name not in env:
+                self.error(f"use of undefined identifier {name}")
+                return 'int'
+            return self.decay_type(env[name])
+        if tag == 'addr':
+            return 'ptr'
+        if tag == 'deref':
+            base_t = self.check_expr(node[1], env)
+            if not self.pointer_like(base_t):
+                self.error('cannot dereference non-pointer')
+            return 'int'
+        if tag == 'index':
+            base_t = self.check_expr(node[1], env)
+            if not self.pointer_like(base_t):
+                self.error('indexing requires pointer or array')
+            self.ensure_int(node[2], env, 'array index')
+            return 'int'
+        if tag == 'assign_l':
+            lval, rval = node[1], node[2]
+            ltype = self.lvalue_type(lval, env)
+            rtype = self.check_expr(rval, env)
+            if ltype == 'array':
+                self.error('cannot assign to array directly')
+            elif ltype != rtype:
+                self.error('type mismatch in assignment')
+            return rtype
+        if tag in ('neg', 'not'):
+            return self.check_expr(node[1], env)
+        if tag in ('+', '-','*','/'):
+            left_t = self.check_expr(node[1], env)
+            right_t = self.check_expr(node[2], env)
+            left_decay = self.decay_type(left_t)
+            right_decay = self.decay_type(right_t)
+            if tag in ('+', '-') and (
+                (self.pointer_like(left_decay) and right_decay == 'int') or
+                (self.pointer_like(right_decay) and left_decay == 'int')
+            ):
+                return 'ptr'
+            if left_decay != 'int' or right_decay != 'int':
+                self.error('arithmetic requires integer operands')
+            return 'int'
+        if tag in ('==','!=','<','>','<=','>='):
+            left_t = self.decay_type(self.check_expr(node[1], env))
+            right_t = self.decay_type(self.check_expr(node[2], env))
+            if left_t != right_t:
+                self.error('comparison operands must have the same type')
+            if tag not in ('==', '!=') and left_t != 'int':
+                self.error('ordered comparison requires integer operands')
+            return 'int'
+        if tag in ('and','or'):
+            self.ensure_int(node[1], env, 'logical operand')
+            self.ensure_int(node[2], env, 'logical operand')
+            return 'int'
+        if tag == 'call':
+            callee = node[1]
+            sig = self.functions.get(callee)
+            if sig is None:
+                self.error(f'call to undefined function {callee}')
+                return 'int'
+            args = node[2]
+            expected = sig['params']
+            if len(args) != len(expected):
+                self.error(f'function {callee} expects {len(expected)} arguments')
+            for idx, arg in enumerate(args[:len(expected)]):
+                actual_t = self.check_expr(arg, env)
+                want = expected[idx]
+                if actual_t != want:
+                    self.error(f'argument {idx+1} to {callee} must be {want}')
+            return 'int' if sig['rettype'] == 'int' else 'void'
+        self.error(f"unsupported expression node {tag}")
+        return 'int'
+
+    def lvalue_type(self, node, env):
+        if isinstance(node, tuple):
+            tag = node[0]
+            if tag == 'id':
+                name = node[1]
+                if name not in env:
+                    self.error(f"use of undefined identifier {name}")
+                    return 'int'
+                return env[name]
+            if tag == 'deref':
+                return 'int'
+            if tag == 'index':
+                return 'int'
+        return 'int'
 
 def main():
     args = sys.argv[1:]
