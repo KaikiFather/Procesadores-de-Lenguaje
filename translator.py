@@ -16,10 +16,10 @@ def stride_from_dims(dims, start_index):
 class CLexer(Lexer):
     tokens = {
         'FID', 'ID', 'CTEENT', 'ASSIGN', 'OR', 'AND', 'NOT',
-        'EQ', 'NE', 'LE', 'GE', 'LT', 'GT', 'INT', 'RETURN',
+        'EQ', 'NE', 'LE', 'GE', 'LT', 'GT', 'INT', 'CHAR', 'RETURN',
         'VOID', 'STRING', 'AMP', 'IF', 'ELSE', 'WHILE'
     }
-    literals = {'+', '-', '*', '/', '(', ')', ';', '{', '}', ',', '[', ']'}
+    literals = {'+', '-', '*', '/', '%', '(', ')', ';', '{', '}', ',', '[', ']'}
     ignore = ' \t'
 
     @_(r'//[^\n]*')
@@ -30,6 +30,8 @@ class CLexer(Lexer):
     def FID(self, t):
         if t.value == 'int':
             t.type = 'INT'
+        elif t.value == 'char':
+            t.type = 'CHAR'
         elif t.value == 'void':
             t.type = 'VOID'
         elif t.value == 'return':
@@ -42,6 +44,7 @@ class CLexer(Lexer):
 
     INT     = r'int'
     VOID    = r'void'
+    CHAR    = r'char'
     RETURN  = r'return'
     IF      = r'if'
     ELSE    = r'else'
@@ -83,7 +86,7 @@ class CParser(Parser):
         ('left', 'AND'),
         ('left', 'EQ', 'NE', 'LT', 'GT', 'LE', 'GE'),
         ('left', '+', '-'),
-        ('left', '*', '/'),
+        ('left', '*', '/', '%'),
         ('right', 'NOT', 'AMP', 'UMINUS', 'DEREF'),
     )
 
@@ -113,6 +116,9 @@ class CParser(Parser):
 
     # ---------- declarations ----------
     @_( 'INT declarator_list' )
+    def var_decl(self, p): return p.declarator_list
+
+    @_( 'CHAR declarator_list' )
     def var_decl(self, p): return p.declarator_list
 
     @_( 'declarator' )
@@ -170,6 +176,9 @@ class CParser(Parser):
     @_( 'INT' )
     def type_spec(self, p): return 'int'
 
+    @_( 'CHAR' )
+    def type_spec(self, p): return 'int'
+
     @_( 'VOID' )
     def type_spec(self, p): return 'void'
 
@@ -197,6 +206,12 @@ class CParser(Parser):
     def param(self, p): return ('param', p.ID)
 
     @_( 'INT "*" ID' )
+    def param(self, p): return ('paramptr', p.ID)
+
+    @_( 'CHAR ID' )
+    def param(self, p): return ('param', p.ID)
+
+    @_( 'CHAR "*" ID' )
     def param(self, p): return ('paramptr', p.ID)
 
     # ---------- statements & blocks ----------
@@ -305,6 +320,9 @@ class CParser(Parser):
 
     @_( 'mul_expr "/" unary' )
     def mul_expr(self, p): return ('/', p.mul_expr, p.unary)
+
+    @_( 'mul_expr "%" unary' )
+    def mul_expr(self, p): return ('%', p.mul_expr, p.unary)
 
     @_( 'unary' )
     def mul_expr(self, p): return p.unary
@@ -709,7 +727,7 @@ class CodeGen:
             self.em.emit('    movl $1, %eax')
             self.em.emit(f'{lbl_end}:')
             return
-        if tag in ('+', '-', '*', '/'):
+        if tag in ('+', '-', '*', '/', '%'):
             left, right = node[1], node[2]
             if tag == '-' and self.is_pointer_value(left, fn) and self.is_pointer_value(right, fn):
                 stride = self.pointer_stride(left, fn)
@@ -805,10 +823,15 @@ class CodeGen:
                     self.em.emit(f'    subl {rhs_operand}, %eax')
                 elif tag == '*':
                     self.em.emit(f'    imull {rhs_operand}, %eax')
+                elif tag == '/':
+                    self.em.emit(f'    movl {rhs_operand}, %ebx')
+                    self.em.emit('    cdq')
+                    self.em.emit('    idivl %ebx')
                 else:
                     self.em.emit(f'    movl {rhs_operand}, %ebx')
                     self.em.emit('    cdq')
                     self.em.emit('    idivl %ebx')
+                    self.em.emit('    movl %edx, %eax')
                 return
             self.gen_expr(left, fn)
             self.em.emit('    pushl %eax')
@@ -821,9 +844,13 @@ class CodeGen:
                 self.em.emit('    subl %ebx, %eax')
             elif tag == '*':
                 self.em.emit('    imull %ebx, %eax')
+            elif tag == '/':
+                self.em.emit('    cdq')
+                self.em.emit('    idivl %ebx')
             else:
                 self.em.emit('    cdq')
                 self.em.emit('    idivl %ebx')
+                self.em.emit('    movl %edx, %eax')
             return
         # basic fallback
 
@@ -1135,8 +1162,16 @@ class CodeGen:
                             locals_info.append({'name': name, 'size': 4 * elems, 'type': 'array', 'dims': dims})
                 elif isinstance(it, list):
                     walk(it)
-                elif isinstance(it, tuple) and it and it[0] == 'block':
-                    walk(it[1])
+                elif isinstance(it, tuple) and it:
+                    tag = it[0]
+                    if tag == 'block':
+                        walk(it[1])
+                    elif tag == 'while':
+                        walk([it[2]])
+                    elif tag == 'if':
+                        walk([it[2]])
+                        if it[3] is not None:
+                            walk([it[3]])
 
         walk(body)
         offsets = {}
@@ -1362,8 +1397,16 @@ class TypeChecker:
                             local_array_dims[name] = list(d[2])
                 elif isinstance(it, list):
                     walk(it)
-                elif isinstance(it, tuple) and it and it[0] == 'block':
-                    walk(it[1])
+                elif isinstance(it, tuple) and it:
+                    tag = it[0]
+                    if tag == 'block':
+                        walk(it[1])
+                    elif tag == 'while':
+                        walk([it[2]])
+                    elif tag == 'if':
+                        walk([it[2]])
+                        if it[3] is not None:
+                            walk([it[3]])
 
         walk(body)
         return env, local_array_dims
@@ -1509,7 +1552,7 @@ class TypeChecker:
         if tag == 'not':
             self.ensure_int(node[1], env, 'logical not')
             return 'int'
-        if tag in ('+', '-', '*', '/'):
+        if tag in ('+', '-', '*', '/', '%'):
             left = node[1]
             right = node[2]
             left_t = self.check_expr(left, env)
