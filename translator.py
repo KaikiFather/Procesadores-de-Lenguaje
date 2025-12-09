@@ -1442,7 +1442,7 @@ class TypeChecker:
         if isinstance(node, tuple):
             tag = node[0]
             if tag == 'id':
-                dims = self.current_array_dims.get(node[1], self.global_array_dims.get(node[1]))
+                dims = self.current_array_dims.get(node[1])
                 if dims is not None:
                     return node[1], dims, 0
             if tag == 'index':
@@ -1466,7 +1466,7 @@ class TypeChecker:
             stride *= d if d else 1
         return stride
 
-    def pointer_compatible(self, left, right, env):
+    def pointer_compatible(self, left, right):
         left_stride = self.pointer_stride_env(left)
         right_stride = self.pointer_stride_env(right)
         return left_stride == right_stride
@@ -1528,7 +1528,7 @@ class TypeChecker:
             ):
                 return 'ptr'
             if tag == '-' and self.pointer_like(left_decay) and self.pointer_like(right_decay):
-                if not self.pointer_compatible(left, right, env):
+                if not self.pointer_compatible(left, right):
                     self.error('cannot subtract pointers to different base types')
                 return 'int'
             if tag == '-' and self.pointer_like(left_decay) and right_decay == 'int':
