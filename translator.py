@@ -2,6 +2,16 @@
 import sys
 from sly import Lexer, Parser
 
+# Shared utilities
+
+
+def stride_from_dims(dims, start_index):
+    start = min(start_index, len(dims))
+    stride = 4
+    for d in dims[start:]:
+        stride *= d if d else 1
+    return stride
+
 # --------- Lexer ---------
 class CLexer(Lexer):
     tokens = {
@@ -440,7 +450,7 @@ class CodeGen:
                 name, info, offset = const_info
                 kind = info.get('kind')
                 if kind == 'local':
-                    adj = info['offset'] - offset
+                    adj = info['offset'] + offset
                     self.em.emit(f'    leal {adj}(%ebp), %eax')
                     return
                 if kind == 'global':
@@ -456,7 +466,7 @@ class CodeGen:
                 kind = info.get('kind')
                 if info.get('type') == 'array':
                     if kind == 'local':
-                        adj = info['offset'] - offset
+                        adj = info['offset'] + offset
                         self.em.emit(f'    leal {adj}(%ebp), %eax')
                         return
                     if kind == 'global':
@@ -492,7 +502,7 @@ class CodeGen:
             if isinstance(base, tuple) and base[0] == 'id':
                 info = self.lookup(fn, base[1])
                 if info.get('kind') == 'local' and info.get('type') == 'array':
-                    self.em.emit('    subl %eax, %ebx')
+                    self.em.emit('    addl %eax, %ebx')
                     self.em.emit('    movl %ebx, %eax')
                     return
             self.em.emit('    addl %eax, %ebx')
@@ -522,12 +532,7 @@ class CodeGen:
         if info is None:
             return 4
         _, dims, level = info
-        start = level + 1 if dims else 0
-        remaining = dims[start:] if start < len(dims) else []
-        stride = 4
-        for d in remaining:
-            stride *= d if d else 1
-        return stride
+        return stride_from_dims(dims, level + 1 if dims else 0)
 
     def index_direct_operand(self, node, fn):
         res = self.const_index_offset(node, fn)
@@ -536,7 +541,7 @@ class CodeGen:
         name, info, offset = res
         kind = info.get('kind')
         if kind == 'local':
-            adj = info['offset'] - offset
+            adj = info['offset'] + offset
             return f'{adj}(%ebp)'
         if kind == 'global':
             if offset:
@@ -706,6 +711,23 @@ class CodeGen:
             return
         if tag in ('+', '-', '*', '/'):
             left, right = node[1], node[2]
+            if tag == '-' and self.is_pointer_value(left, fn) and self.is_pointer_value(right, fn):
+                stride = self.pointer_stride(left, fn)
+                self.gen_expr(left, fn)
+                self.em.emit('    pushl %eax')
+                rhs_simple = self.simple_operand(right, fn)
+                if rhs_simple is not None:
+                    self.em.emit(f'    movl {rhs_simple}, %eax')
+                else:
+                    self.gen_expr(right, fn)
+                self.em.emit('    movl %eax, %ebx')
+                self.em.emit('    popl %eax')
+                self.em.emit('    subl %ebx, %eax')
+                if stride != 1:
+                    self.em.emit(f'    movl ${stride}, %ebx')
+                    self.em.emit('    cdq')
+                    self.em.emit('    idivl %ebx')
+                return
             if tag in ('+', '-'):
                 stride, pointer_side = self.pointer_arith_info(tag, left, right, fn)
                 if stride is not None:
@@ -877,10 +899,6 @@ class CodeGen:
         return (None, None)
 
     def pointer_offset_sign(self, pointer_expr, fn):
-        if isinstance(pointer_expr, tuple) and pointer_expr[0] == 'id':
-            info = self.lookup(fn, pointer_expr[1])
-            if info.get('kind') == 'local' and info.get('type') == 'array':
-                return -1
         return 1
 
     def is_pointer_value(self, node, fn):
@@ -901,14 +919,7 @@ class CodeGen:
         if info is None:
             return 4
         _, dims, level = info
-        if not dims:
-            return 4
-        start = level + 1 if level + 1 <= len(dims) else len(dims)
-        remaining = dims[start:]
-        stride = 4
-        for d in remaining:
-            stride *= d if d else 1
-        return stride
+        return stride_from_dims(dims, level + 1)
 
     def simple_operand(self, node, fn):
         """Return an AT&T operand string for simple expressions."""
@@ -1273,6 +1284,8 @@ class TypeChecker:
         self.module_items = module_items
         self.globals = {}
         self.functions = {}
+        self.global_array_dims = {}
+        self.current_array_dims = {}
         self.errors = []
 
     def decay_type(self, typ):
@@ -1306,6 +1319,7 @@ class TypeChecker:
                         self.globals[name] = 'ptr'
                     elif kind == 'array':
                         self.globals[name] = 'array'
+                        self.global_array_dims[name] = list(decl[2])
             elif tag == 'fun':
                 _, rettype, name, params, _ = item
                 param_types = []
@@ -1327,6 +1341,7 @@ class TypeChecker:
 
     def make_env(self, params, body):
         env = dict(self.globals)
+        local_array_dims = {}
         for p in params:
             if p[0] == 'param':
                 env[p[1]] = 'int'
@@ -1344,18 +1359,22 @@ class TypeChecker:
                             env[name] = 'ptr'
                         elif kind == 'array':
                             env[name] = 'array'
+                            local_array_dims[name] = list(d[2])
                 elif isinstance(it, list):
                     walk(it)
                 elif isinstance(it, tuple) and it and it[0] == 'block':
                     walk(it[1])
 
         walk(body)
-        return env
+        return env, local_array_dims
 
     def check_function(self, rettype, name, params, body):
-        env = self.make_env(params, body)
+        env, local_array_dims = self.make_env(params, body)
+        prev_array_dims = self.current_array_dims
+        self.current_array_dims = {**self.global_array_dims, **local_array_dims}
         for stmt in body:
             self.check_stmt(stmt, env, rettype)
+        self.current_array_dims = prev_array_dims
 
     def ensure_int(self, node, env, context):
         typ = self.check_expr(node, env)
@@ -1418,6 +1437,34 @@ class TypeChecker:
         else:
             self.error(f"unsupported statement node {tag}")
 
+    def resolve_array_env(self, node):
+        if isinstance(node, tuple):
+            tag = node[0]
+            if tag == 'id':
+                dims = self.current_array_dims.get(node[1])
+                if dims is not None:
+                    return node[1], dims, 0
+            if tag == 'index':
+                res = self.resolve_array_env(node[1])
+                if res is not None:
+                    name, dims, level = res
+                    return name, dims, level + 1
+            if tag == 'addr':
+                return self.resolve_array_env(node[1])
+        return None
+
+    def pointer_stride_env(self, node):
+        info = self.resolve_array_env(node)
+        if info is None:
+            return 4
+        _, dims, level = info
+        return stride_from_dims(dims, level + 1)
+
+    def pointer_compatible(self, left, right):
+        left_stride = self.pointer_stride_env(left)
+        right_stride = self.pointer_stride_env(right)
+        return left_stride == right_stride
+
     def check_expr(self, node, env):
         if node is None:
             return 'void'
@@ -1462,9 +1509,11 @@ class TypeChecker:
         if tag == 'not':
             self.ensure_int(node[1], env, 'logical not')
             return 'int'
-        if tag in ('+', '-','*','/'):
-            left_t = self.check_expr(node[1], env)
-            right_t = self.check_expr(node[2], env)
+        if tag in ('+', '-', '*', '/'):
+            left = node[1]
+            right = node[2]
+            left_t = self.check_expr(left, env)
+            right_t = self.check_expr(right, env)
             left_decay = self.decay_type(left_t)
             right_decay = self.decay_type(right_t)
             if tag == '+' and (
@@ -1473,6 +1522,8 @@ class TypeChecker:
             ):
                 return 'ptr'
             if tag == '-' and self.pointer_like(left_decay) and self.pointer_like(right_decay):
+                if not self.pointer_compatible(left, right):
+                    self.error('cannot subtract pointers to different base types')
                 return 'int'
             if tag == '-' and self.pointer_like(left_decay) and right_decay == 'int':
                 return 'ptr'
